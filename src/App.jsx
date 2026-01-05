@@ -1,6 +1,7 @@
-import React, { useState, useCallback } from 'react';
-import { FileText, Table, X, Download, Loader2, UploadCloud, CheckCircle, AlertCircle } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import React, { useState } from 'react';
+import { FileText, Table, X, Loader2, UploadCloud, CheckCircle, AlertCircle } from 'lucide-react';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
+import ExcelJS from 'exceljs';
 import * as XLSX from 'xlsx';
 import mammoth from 'mammoth';
 import html2canvas from 'html2canvas';
@@ -23,31 +24,43 @@ function App() {
   const onDrop = (e) => {
     e.preventDefault();
     setIsDragging(false);
-    const droppedFiles = Array.from(e.dataTransfer.files);
-    handleFiles(droppedFiles);
+    if (e.dataTransfer && e.dataTransfer.files) {
+      const droppedFiles = Array.from(e.dataTransfer.files);
+      handleFiles(droppedFiles);
+    }
   };
 
   const onFileInput = (e) => {
-    const selectedFiles = Array.from(e.target.files);
-    handleFiles(selectedFiles);
+    if (e.target && e.target.files) {
+      const selectedFiles = Array.from(e.target.files);
+      handleFiles(selectedFiles);
+      // Reset input value to allow selecting the same file again
+      e.target.value = '';
+    }
   };
 
   const handleFiles = (newFiles) => {
-    const validFiles = newFiles.filter(file =>
-      file.name.endsWith('.xlsx') ||
-      file.name.endsWith('.xls') ||
-      file.name.endsWith('.docx')
-    );
+    const validFiles = newFiles.filter(file => {
+      const name = file.name.toLowerCase();
+      return name.endsWith('.xlsx') ||
+             name.endsWith('.xls') ||
+             name.endsWith('.docx');
+    });
 
-    const formattedFiles = validFiles.map(file => ({
-      id: Math.random().toString(36).substr(2, 9),
-      file,
-      name: file.name,
-      type: (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) ? 'excel' : 'word',
-      size: (file.size / 1024 / 1024).toFixed(2) + ' MB',
-      status: 'idle', // idle, converting, success, error
-      errorMessage: ''
-    }));
+    const formattedFiles = validFiles.map(file => {
+      const name = file.name.toLowerCase();
+      return {
+        id: Math.random().toString(36).slice(2, 11),
+        file,
+        name: file.name,
+        type: (name.endsWith('.xlsx') || name.endsWith('.xls')) ? 'excel' : 'word',
+        size: (file.size / 1024 / 1024).toFixed(2) + ' MB',
+        status: 'idle', // idle, loaded, converting, success, error
+        errorMessage: '',
+        sheets: null, // Will store sheet list for Excel files
+        selectedSheets: [] // Indices of selected sheets
+      };
+    });
 
     setFiles(prev => [...prev, ...formattedFiles]);
   };
@@ -56,7 +69,80 @@ function App() {
     setFiles(prev => prev.filter(f => f.id !== id));
   };
 
+  const loadExcelSheets = async (fileItem) => {
+    try {
+      const fileName = fileItem.name.toLowerCase();
+      const isXlsx = fileName.endsWith('.xlsx');
+      const arrayBuffer = await fileItem.file.arrayBuffer();
+
+      let sheetNames = [];
+
+      if (isXlsx) {
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(arrayBuffer);
+        workbook.eachSheet((worksheet) => {
+          sheetNames.push(worksheet.name);
+        });
+      } else {
+        const data = new Uint8Array(arrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        sheetNames = workbook.SheetNames;
+      }
+
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'loaded',
+        sheets: sheetNames,
+        selectedSheets: sheetNames.map((_, idx) => idx) // Select all by default
+      } : f));
+    } catch (error) {
+      console.error('Error loading sheets:', error);
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'error',
+        errorMessage: 'Failed to load sheets'
+      } : f));
+    }
+  };
+
+  const toggleSheetSelection = (fileId, sheetIndex) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id !== fileId) return f;
+      const selected = f.selectedSheets.includes(sheetIndex);
+      return {
+        ...f,
+        selectedSheets: selected
+          ? f.selectedSheets.filter(i => i !== sheetIndex)
+          : [...f.selectedSheets, sheetIndex].sort((a, b) => a - b)
+      };
+    }));
+  };
+
+  const toggleAllSheets = (fileId, selectAll) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id !== fileId) return f;
+      return {
+        ...f,
+        selectedSheets: selectAll ? f.sheets.map((_, idx) => idx) : []
+      };
+    }));
+  };
+
   const convertFile = async (fileItem) => {
+    // For Excel files in 'idle' state, load sheets first
+    if (fileItem.type === 'excel' && fileItem.status === 'idle') {
+      await loadExcelSheets(fileItem);
+      return;
+    }
+
+    // For Excel files in 'loaded' state, convert selected sheets
+    if (fileItem.type === 'excel' && fileItem.status === 'loaded') {
+      if (fileItem.selectedSheets.length === 0) {
+        alert('少なくとも1つのシートを選択してください');
+        return;
+      }
+    }
+
     setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'converting' } : f));
 
     try {
@@ -68,31 +154,410 @@ function App() {
 
       setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'success' } : f));
     } catch (error) {
-      console.error(error);
-      setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'error', errorMessage: 'Conversion failed' } : f));
+      console.error('Conversion error:', error);
+      const errorMsg = error.message || 'Conversion failed';
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      });
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'error',
+        errorMessage: errorMsg.length > 50 ? errorMsg.substring(0, 50) + '...' : errorMsg
+      } : f));
     }
   };
 
-  const convertExcelToImage = (fileItem) => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const data = new Uint8Array(e.target.result);
-          const workbook = XLSX.read(data, { type: 'array' });
+  const convertExcelToImage = async (fileItem) => {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const fileName = fileItem.name.toLowerCase();
+        const isXlsx = fileName.endsWith('.xlsx');
 
-          // Convert first sheet to HTML
-          const firstSheetName = workbook.SheetNames[0];
-          const worksheet = workbook.Sheets[firstSheetName];
-          const html = XLSX.utils.sheet_to_html(worksheet);
+        if (isXlsx) {
+          // Use ExcelJS for .xlsx files (better style support)
+          const arrayBuffer = await fileItem.file.arrayBuffer();
+          const workbook = new ExcelJS.Workbook();
+          await workbook.xlsx.load(arrayBuffer);
 
-          generateImage(html, fileItem.name.replace(/\.[^/.]+$/, ""), resolve, reject);
-        } catch (err) {
-          reject(err);
+          const baseFileName = fileItem.name.replace(/\.[^/.]+$/, "");
+          const sheets = [];
+
+          workbook.eachSheet((worksheet) => {
+            sheets.push(worksheet);
+          });
+
+          console.log('Workbook loaded, sheets:', sheets.length);
+
+          // Get selected sheet indices (default to all if not specified)
+          const selectedIndices = fileItem.selectedSheets && fileItem.selectedSheets.length > 0
+            ? fileItem.selectedSheets
+            : sheets.map((_, idx) => idx);
+
+          console.log(`Converting ${selectedIndices.length} of ${sheets.length} sheets`);
+
+          // Process only selected sheets
+          for (let i = 0; i < selectedIndices.length; i++) {
+            const index = selectedIndices[i];
+            const worksheet = sheets[index];
+            console.log(`Processing sheet ${i + 1}/${selectedIndices.length}: ${worksheet.name}`);
+
+            try {
+              const sheetHtml = generateSheetHtmlWithExcelJS(worksheet);
+
+              if (sheetHtml) {
+                const htmlWithHeader = `
+                  <div class="sheet-container">
+                    <h2>${worksheet.name}</h2>
+                    ${sheetHtml}
+                  </div>
+                `;
+
+                // Generate individual image for each sheet
+                const sheetFileName = `${baseFileName}_${String(index + 1).padStart(2, '0')}_${worksheet.name.replace(/[^\w\s-]/g, '_')}`;
+                await new Promise((resolveSheet, rejectSheet) => {
+                  generateImage(htmlWithHeader, sheetFileName, resolveSheet, rejectSheet, 'excel');
+                });
+
+                // Small delay between sheets
+                await new Promise(r => setTimeout(r, 100));
+              }
+            } catch (sheetError) {
+              console.error(`Error processing sheet "${worksheet.name}":`, sheetError);
+              // Continue with other sheets
+            }
+          }
+
+          resolve();
+        } else {
+          // Use SheetJS for .xls files (legacy format)
+          const arrayBuffer = await fileItem.file.arrayBuffer();
+          const data = new Uint8Array(arrayBuffer);
+
+          console.log('Loading .xls file with SheetJS, size:', data.length, 'bytes');
+
+          const workbook = XLSX.read(data, { type: 'array', cellStyles: true });
+
+          console.log('Workbook loaded, sheets:', workbook.SheetNames.length);
+
+          const baseFileName = fileItem.name.replace(/\.[^/.]+$/, "");
+
+          // Get selected sheet indices (default to all if not specified)
+          const selectedIndices = fileItem.selectedSheets && fileItem.selectedSheets.length > 0
+            ? fileItem.selectedSheets
+            : workbook.SheetNames.map((_, idx) => idx);
+
+          console.log(`Converting ${selectedIndices.length} of ${workbook.SheetNames.length} sheets`);
+
+          // Process only selected sheets
+          for (let i = 0; i < selectedIndices.length; i++) {
+            const index = selectedIndices[i];
+            const sheetName = workbook.SheetNames[index];
+            console.log(`Processing sheet ${i + 1}/${selectedIndices.length}: ${sheetName}`);
+
+            const worksheet = workbook.Sheets[sheetName];
+
+            if (!worksheet['!ref']) {
+              console.log(`Sheet "${sheetName}" has no range, skipping`);
+              continue;
+            }
+
+            console.log(`Sheet "${sheetName}" range:`, worksheet['!ref']);
+
+            try {
+              const sheetHtml = generateSheetHtmlWithSheetJS(worksheet);
+
+              if (sheetHtml) {
+                const htmlWithHeader = `
+                  <div class="sheet-container">
+                    <h2>${sheetName}</h2>
+                    ${sheetHtml}
+                  </div>
+                `;
+
+                // Generate individual image for each sheet
+                const sheetFileName = `${baseFileName}_${String(index + 1).padStart(2, '0')}_${sheetName.replace(/[^\w\s-]/g, '_')}`;
+                await new Promise((resolveSheet, rejectSheet) => {
+                  generateImage(htmlWithHeader, sheetFileName, resolveSheet, rejectSheet, 'excel');
+                });
+
+                // Small delay between sheets to avoid overwhelming the browser
+                await new Promise(r => setTimeout(r, 100));
+              }
+            } catch (sheetError) {
+              console.error(`Error processing sheet "${sheetName}":`, sheetError);
+              // Continue with other sheets
+            }
+          }
+
+          resolve();
         }
-      };
-      reader.readAsArrayBuffer(fileItem.file);
+      } catch (err) {
+        reject(err);
+      }
     });
+  };
+
+  const generateSheetHtmlWithSheetJS = (worksheet) => {
+    const range = XLSX.utils.decode_range(worksheet['!ref']);
+    const merges = worksheet['!merges'] || [];
+    const cols = worksheet['!cols'] || [];
+    const rows = worksheet['!rows'] || [];
+
+    let html = '<table>';
+
+    // Generate colgroup for column widths
+    html += '<colgroup>';
+    for (let C = range.s.c; C <= range.e.c; ++C) {
+      const col = cols[C];
+      let width = 80;
+      if (col) {
+        if (col.wpx) width = col.wpx;
+        else if (col.wch) width = col.wch * 8;
+        else if (col.width) width = col.width * 8;
+      }
+      html += `<col style="width: ${Math.max(width, 30)}px;">`;
+    }
+    html += '</colgroup>';
+
+    // Pre-calculate merged cells map
+    const skipMap = new Set();
+    const mergeMap = {};
+
+    merges.forEach(merge => {
+      const startR = merge.s.r;
+      const startC = merge.s.c;
+      const endR = merge.e.r;
+      const endC = merge.e.c;
+
+      mergeMap[`${startR},${startC}`] = {
+        rowspan: endR - startR + 1,
+        colspan: endC - startC + 1
+      };
+
+      for (let r = startR; r <= endR; r++) {
+        for (let c = startC; c <= endC; c++) {
+          if (r === startR && c === startC) continue;
+          skipMap.add(`${r},${c}`);
+        }
+      }
+    });
+
+    for (let R = range.s.r; R <= range.e.r; ++R) {
+      const row = rows[R];
+      let rowHeight = 20;
+      if (row) {
+        if (row.hpx) rowHeight = row.hpx;
+        else if (row.hpt) rowHeight = row.hpt * 1.33;
+      }
+
+      html += `<tr style="height: ${rowHeight}px;">`;
+
+      for (let C = range.s.c; C <= range.e.c; ++C) {
+        if (skipMap.has(`${R},${C}`)) continue;
+
+        const cellAddress = { c: C, r: R };
+        const cellRef = XLSX.utils.encode_cell(cellAddress);
+        const cell = worksheet[cellRef];
+
+        let cellValue = '';
+        if (cell) {
+          cellValue = (cell.w || cell.v || '').toString();
+          cellValue = cellValue
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;')
+            .replace(/\n/g, '<br>');
+        }
+
+        const mergeInfo = mergeMap[`${R},${C}`];
+        const rowspan = mergeInfo ? `rowspan="${mergeInfo.rowspan}"` : '';
+        const colspan = mergeInfo ? `colspan="${mergeInfo.colspan}"` : '';
+
+        // Basic styling for .xls files
+        let styleStr = 'border: 1px solid #d0d0d0; padding: 4px 6px; vertical-align: middle; ';
+
+        // Number alignment
+        if (cell && cell.t === 'n') {
+          styleStr += 'text-align: right; ';
+        }
+
+        // Header rows heuristic
+        if (R <= 2) {
+          styleStr += 'font-weight: bold; background-color: #e8e8e8; text-align: center; ';
+        }
+
+        html += `<td ${rowspan} ${colspan} style="${styleStr}">${cellValue || '&nbsp;'}</td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</table>';
+
+    return html;
+  };
+
+  const generateSheetHtmlWithExcelJS = (worksheet) => {
+    // Helper to convert RGB object to hex
+    const rgbToHex = (rgb) => {
+      if (!rgb) return null;
+      if (typeof rgb === 'string') return rgb.startsWith('#') ? rgb : `#${rgb}`;
+      if (rgb.argb) return `#${rgb.argb.substring(2)}`;
+      return null;
+    };
+
+    // Helper to get border style
+    const getBorderStyle = (border) => {
+      if (!border || !border.style) return '1px solid #d0d0d0';
+      const width = border.style === 'thin' ? '1px' : border.style === 'medium' ? '2px' : border.style === 'thick' ? '3px' : '1px';
+      const color = border.color ? rgbToHex(border.color) || '#000' : '#000';
+      return `${width} solid ${color}`;
+    };
+
+    // Build map of merged cells
+    const mergedCellsMap = new Map();
+    const skipCells = new Set();
+
+    if (worksheet._merges && Object.keys(worksheet._merges).length > 0) {
+      Object.values(worksheet._merges).forEach(merge => {
+        const { top, left, bottom, right } = merge;
+        const masterKey = `${top},${left}`;
+        mergedCellsMap.set(masterKey, {
+          rowspan: bottom - top + 1,
+          colspan: right - left + 1
+        });
+
+        // Mark cells to skip
+        for (let r = top; r <= bottom; r++) {
+          for (let c = left; c <= right; c++) {
+            if (r !== top || c !== left) {
+              skipCells.add(`${r},${c}`);
+            }
+          }
+        }
+      });
+    }
+
+    // Get actual dimensions
+    const rowCount = worksheet.rowCount || 100;
+    const colCount = worksheet.columnCount || 20;
+
+    let html = '<table>';
+
+    // Generate colgroup for column widths
+    html += '<colgroup>';
+    for (let c = 1; c <= colCount; c++) {
+      const col = worksheet.getColumn(c);
+      const width = col.width ? col.width * 7 : 80;
+      html += `<col style="width: ${width}px;">`;
+    }
+    html += '</colgroup>';
+
+    // Iterate through rows
+    for (let r = 1; r <= rowCount; r++) {
+      const row = worksheet.getRow(r);
+      const rowHeight = row.height ? row.height * 1.33 : 20;
+      html += `<tr style="height: ${rowHeight}px;">`;
+
+      for (let c = 1; c <= colCount; c++) {
+        // Skip if this cell is part of a merge (but not the master)
+        if (skipCells.has(`${r},${c}`)) {
+          continue;
+        }
+
+        const cell = worksheet.getCell(r, c);
+
+        let cellValue = '';
+        if (cell.value !== null && cell.value !== undefined) {
+          if (cell.value.richText) {
+            cellValue = cell.value.richText.map(rt => rt.text).join('');
+          } else if (typeof cell.value === 'object' && cell.value.text) {
+            cellValue = cell.value.text;
+          } else {
+            cellValue = cell.value.toString();
+          }
+        }
+
+        // HTML escape
+        cellValue = cellValue
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;')
+          .replace(/\n/g, '<br>');
+
+        // Handle merged cells
+        let rowspan = '';
+        let colspan = '';
+        const mergeKey = `${r},${c}`;
+        if (mergedCellsMap.has(mergeKey)) {
+          const merge = mergedCellsMap.get(mergeKey);
+          rowspan = merge.rowspan > 1 ? `rowspan="${merge.rowspan}"` : '';
+          colspan = merge.colspan > 1 ? `colspan="${merge.colspan}"` : '';
+        }
+
+        // Build cell style
+        let styleStr = '';
+
+        // Borders
+        if (cell.border) {
+          if (cell.border.top) styleStr += `border-top: ${getBorderStyle(cell.border.top)}; `;
+          if (cell.border.bottom) styleStr += `border-bottom: ${getBorderStyle(cell.border.bottom)}; `;
+          if (cell.border.left) styleStr += `border-left: ${getBorderStyle(cell.border.left)}; `;
+          if (cell.border.right) styleStr += `border-right: ${getBorderStyle(cell.border.right)}; `;
+        } else {
+          styleStr += 'border: 1px solid #d0d0d0; ';
+        }
+
+        styleStr += 'padding: 4px 6px; ';
+
+        // Background color
+        if (cell.fill && cell.fill.type === 'pattern' && cell.fill.fgColor) {
+          const bgColor = rgbToHex(cell.fill.fgColor);
+          if (bgColor) styleStr += `background-color: ${bgColor}; `;
+        }
+
+        // Font styles
+        if (cell.font) {
+          if (cell.font.size) styleStr += `font-size: ${cell.font.size}px; `;
+          if (cell.font.bold) styleStr += 'font-weight: bold; ';
+          if (cell.font.italic) styleStr += 'font-style: italic; ';
+          if (cell.font.underline) styleStr += 'text-decoration: underline; ';
+          if (cell.font.color) {
+            const fontColor = rgbToHex(cell.font.color);
+            if (fontColor) styleStr += `color: ${fontColor}; `;
+          }
+          if (cell.font.name) styleStr += `font-family: "${cell.font.name}", sans-serif; `;
+        }
+
+        // Text alignment
+        if (cell.alignment) {
+          if (cell.alignment.horizontal) {
+            const hAlign = cell.alignment.horizontal;
+            styleStr += `text-align: ${hAlign === 'center' ? 'center' : hAlign === 'right' ? 'right' : 'left'}; `;
+          }
+          if (cell.alignment.vertical) {
+            const vAlign = cell.alignment.vertical;
+            styleStr += `vertical-align: ${vAlign === 'middle' ? 'middle' : vAlign === 'top' ? 'top' : 'bottom'}; `;
+          }
+          if (cell.alignment.wrapText) {
+            styleStr += 'white-space: pre-wrap; word-wrap: break-word; ';
+          } else {
+            styleStr += 'white-space: nowrap; ';
+          }
+        }
+
+        html += `<td ${rowspan} ${colspan} style="${styleStr}">${cellValue || '&nbsp;'}</td>`;
+      }
+
+      html += '</tr>';
+    }
+
+    html += '</table>';
+    return html;
   };
 
   const convertWordToImage = (fileItem) => {
@@ -102,7 +567,7 @@ function App() {
         mammoth.convertToHtml({ arrayBuffer: e.target.result })
           .then(result => {
             const html = `<div class="word-content">${result.value}</div>`;
-            generateImage(html, fileItem.name.replace(/\.[^/.]+$/, ""), resolve, reject);
+            generateImage(html, fileItem.name.replace(/\.[^/.]+$/, ""), resolve, reject, 'word');
           })
           .catch(err => reject(err));
       };
@@ -110,17 +575,18 @@ function App() {
     });
   };
 
-  const generateImage = async (htmlContent, fileName, resolve, reject) => {
-    // Create a temporary iframe to isolate styles from Tailwind v4 (oklch issue)
+  const generateImage = async (htmlContent, fileName, resolve, reject, fileType) => {
+    console.log('Generating image for:', fileName, 'Type:', fileType);
+
+    // Create a temporary iframe for complete style isolation
     const iframe = document.createElement('iframe');
-    iframe.style.position = 'fixed';
+    iframe.style.position = 'absolute';
+    iframe.style.left = '-9999px';
     iframe.style.top = '0';
-    iframe.style.left = '0';
-    iframe.style.width = '800px';
-    iframe.style.height = '1200px';
+    iframe.style.width = '1400px'; // Set a fixed width or make it dynamic
+    iframe.style.height = 'auto';
+    iframe.style.visibility = 'visible'; // Needed for html2canvas
     iframe.style.zIndex = '-9999';
-    iframe.style.opacity = '0';
-    iframe.style.pointerEvents = 'none';
     iframe.style.border = 'none';
 
     document.body.appendChild(iframe);
@@ -129,36 +595,55 @@ function App() {
       const doc = iframe.contentWindow.document;
       doc.open();
       doc.write(`
+        <!DOCTYPE html>
         <html>
           <head>
             <style>
               body {
-                font-family: Arial, sans-serif;
-                font-size: 12px;
-                color: #000000;
                 background-color: #ffffff;
-                padding: 40px;
                 margin: 0;
+                padding: 40px;
+                font-family: "MS PGothic", "MS Gothic", "Meiryo", Arial, sans-serif;
+                font-size: 11px;
+                color: #000000;
               }
               table {
-                width: 100%;
                 border-collapse: collapse;
-                margin-bottom: 20px;
-                border: 1px solid #dddddd;
+                background: #ffffff;
+                margin-bottom: 30px;
+                table-layout: fixed;
               }
-              td, th {
-                border: 1px solid #dddddd;
-                padding: 8px;
+              td {
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+              .sheet-container {
+                margin-bottom: 50px;
                 background-color: #ffffff;
+                page-break-after: always;
+              }
+              h2 {
+                font-size: 16px;
                 color: #000000;
+                border-bottom: 2px solid #000000;
+                padding-bottom: 8px;
+                margin-bottom: 20px;
+                margin-top: 0;
+                font-weight: bold;
+                font-family: "MS PGothic", "MS Gothic", "Meiryo", Arial, sans-serif;
               }
               .word-content {
                 color: #000000;
+                line-height: 1.6;
+                max-width: 800px;
+              }
+              .word-content p {
+                margin-bottom: 10px;
               }
             </style>
           </head>
           <body>
-            ${htmlContent}
+            <div id="render-content">${htmlContent}</div>
           </body>
         </html>
       `);
@@ -167,30 +652,52 @@ function App() {
       // Wait for content render
       await new Promise(r => setTimeout(r, 500));
 
+      // Adjust iframe height to fit content
+      const contentHeight = doc.body.scrollHeight;
+      const contentWidth = doc.body.scrollWidth;
+      iframe.style.height = (contentHeight + 100) + 'px';
+      iframe.style.width = (Math.max(contentWidth, 1000)) + 'px';
+
       const canvas = await html2canvas(doc.body, {
         scale: 2,
         useCORS: true,
-        backgroundColor: '#ffffff'
+        backgroundColor: '#ffffff',
+        logging: false,
+        width: Math.max(contentWidth, 1000),
+        height: contentHeight
       });
 
-      const image = canvas.toDataURL("image/png");
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('Canvas to Blob conversion failed'));
+          return;
+        }
 
-      // Trigger download
-      const link = document.createElement('a');
-      link.href = image;
-      link.download = `${fileName}.png`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+        const url = URL.createObjectURL(blob);
 
-      // Clean up extendedly to ensure no memory leak
-      setTimeout(() => {
+        // Clean up
         if (document.body.contains(iframe)) {
           document.body.removeChild(iframe);
         }
-      }, 100);
 
-      resolve();
+        // Trigger download
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${fileName}.png`;
+        document.body.appendChild(link);
+        link.click();
+
+        // Clean up URL and link
+        setTimeout(() => {
+          if (document.body.contains(link)) {
+            document.body.removeChild(link);
+          }
+          URL.revokeObjectURL(url);
+        }, 100);
+
+        resolve();
+      }, 'image/png');
+
     } catch (err) {
       if (document.body.contains(iframe)) {
         document.body.removeChild(iframe);
@@ -261,61 +768,116 @@ function App() {
         <div className="space-y-4">
           <AnimatePresence>
             {files.map(file => (
-              <motion.div
+              <Motion.div
                 key={file.id}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, height: 0 }}
-                className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center gap-4 shadow-sm"
+                className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm"
               >
-                <div className={`p-3 rounded-lg ${file.type === 'excel' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'}`}>
-                  {file.type === 'excel' ? <Table className="w-6 h-6" /> : <FileText className="w-6 h-6" />}
-                </div>
+                <div className="flex items-center gap-4">
+                  <div className={`p-3 rounded-lg ${file.type === 'excel' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                    {file.type === 'excel' ? <Table className="w-6 h-6" /> : <FileText className="w-6 h-6" />}
+                  </div>
 
-                <div className="flex-1 min-w-0">
-                  <h3 className="font-medium text-slate-200 truncate">{file.name}</h3>
-                  <p className="text-sm text-slate-500">{file.size}</p>
-                </div>
+                  <div className="flex-1 min-w-0">
+                    <h3 className="font-medium text-slate-200 truncate">{file.name}</h3>
+                    <p className="text-sm text-slate-500">
+                      {file.size}
+                      {file.sheets && <span className="ml-2">• {file.sheets.length} sheets</span>}
+                    </p>
+                  </div>
 
-                <div className="flex items-center gap-3">
-                  {file.status === 'idle' && (
+                  <div className="flex items-center gap-3">
+                    {file.status === 'idle' && (
+                      <button
+                        onClick={() => convertFile(file)}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        {file.type === 'excel' ? 'Load Sheets' : 'Convert'}
+                      </button>
+                    )}
+
+                    {file.status === 'loaded' && (
+                      <button
+                        onClick={() => convertFile(file)}
+                        className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        Convert {file.selectedSheets.length} Sheet{file.selectedSheets.length !== 1 ? 's' : ''}
+                      </button>
+                    )}
+
+                    {file.status === 'converting' && (
+                      <div className="flex items-center gap-2 text-blue-400">
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span className="text-sm">Processing...</span>
+                      </div>
+                    )}
+
+                    {file.status === 'success' && (
+                      <div className="flex items-center gap-2 text-green-400">
+                        <CheckCircle className="w-5 h-5" />
+                        <span className="text-sm">Done</span>
+                      </div>
+                    )}
+
+                    {file.status === 'error' && (
+                      <div className="flex items-center gap-2 text-red-400" title={file.errorMessage}>
+                        <AlertCircle className="w-5 h-5" />
+                        <span className="text-sm">Failed</span>
+                      </div>
+                    )}
+
                     <button
-                      onClick={() => convertFile(file)}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      onClick={() => removeFile(file.id)}
+                      className="p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-lg transition-colors"
                     >
-                      Convert
+                      <X className="w-5 h-5" />
                     </button>
-                  )}
-
-                  {file.status === 'converting' && (
-                    <div className="flex items-center gap-2 text-blue-400">
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      <span className="text-sm">Processing...</span>
-                    </div>
-                  )}
-
-                  {file.status === 'success' && (
-                    <div className="flex items-center gap-2 text-green-400">
-                      <CheckCircle className="w-5 h-5" />
-                      <span className="text-sm">Done</span>
-                    </div>
-                  )}
-
-                  {file.status === 'error' && (
-                    <div className="flex items-center gap-2 text-red-400" title={file.errorMessage}>
-                      <AlertCircle className="w-5 h-5" />
-                      <span className="text-sm">Failed</span>
-                    </div>
-                  )}
-
-                  <button
-                    onClick={() => removeFile(file.id)}
-                    className="p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-lg transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
+                  </div>
                 </div>
-              </motion.div>
+
+                {/* Sheet selection UI */}
+                {file.status === 'loaded' && file.sheets && (
+                  <div className="mt-4 pt-4 border-t border-slate-700">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-medium text-slate-300">Select Sheets to Convert</h4>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => toggleAllSheets(file.id, true)}
+                          className="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors"
+                        >
+                          All
+                        </button>
+                        <button
+                          onClick={() => toggleAllSheets(file.id, false)}
+                          className="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors"
+                        >
+                          None
+                        </button>
+                      </div>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto space-y-1 pr-2">
+                      {file.sheets.map((sheetName, index) => (
+                        <label
+                          key={index}
+                          className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-750 rounded cursor-pointer transition-colors"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={file.selectedSheets.includes(index)}
+                            onChange={() => toggleSheetSelection(file.id, index)}
+                            className="w-4 h-4 text-blue-600 bg-slate-700 border-slate-600 rounded focus:ring-blue-500 focus:ring-2"
+                          />
+                          <span className="text-sm text-slate-300 flex-1 truncate">
+                            {String(index + 1).padStart(2, '0')}. {sheetName}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </Motion.div>
             ))}
           </AnimatePresence>
 
