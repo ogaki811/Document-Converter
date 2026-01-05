@@ -55,8 +55,10 @@ function App() {
         name: file.name,
         type: (name.endsWith('.xlsx') || name.endsWith('.xls')) ? 'excel' : 'word',
         size: (file.size / 1024 / 1024).toFixed(2) + ' MB',
-        status: 'idle', // idle, converting, success, error
-        errorMessage: ''
+        status: 'idle', // idle, loaded, converting, success, error
+        errorMessage: '',
+        sheets: null, // Will store sheet list for Excel files
+        selectedSheets: [] // Indices of selected sheets
       };
     });
 
@@ -67,7 +69,80 @@ function App() {
     setFiles(prev => prev.filter(f => f.id !== id));
   };
 
+  const loadExcelSheets = async (fileItem) => {
+    try {
+      const fileName = fileItem.name.toLowerCase();
+      const isXlsx = fileName.endsWith('.xlsx');
+      const arrayBuffer = await fileItem.file.arrayBuffer();
+
+      let sheetNames = [];
+
+      if (isXlsx) {
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(arrayBuffer);
+        workbook.eachSheet((worksheet) => {
+          sheetNames.push(worksheet.name);
+        });
+      } else {
+        const data = new Uint8Array(arrayBuffer);
+        const workbook = XLSX.read(data, { type: 'array' });
+        sheetNames = workbook.SheetNames;
+      }
+
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'loaded',
+        sheets: sheetNames,
+        selectedSheets: sheetNames.map((_, idx) => idx) // Select all by default
+      } : f));
+    } catch (error) {
+      console.error('Error loading sheets:', error);
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'error',
+        errorMessage: 'Failed to load sheets'
+      } : f));
+    }
+  };
+
+  const toggleSheetSelection = (fileId, sheetIndex) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id !== fileId) return f;
+      const selected = f.selectedSheets.includes(sheetIndex);
+      return {
+        ...f,
+        selectedSheets: selected
+          ? f.selectedSheets.filter(i => i !== sheetIndex)
+          : [...f.selectedSheets, sheetIndex].sort((a, b) => a - b)
+      };
+    }));
+  };
+
+  const toggleAllSheets = (fileId, selectAll) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id !== fileId) return f;
+      return {
+        ...f,
+        selectedSheets: selectAll ? f.sheets.map((_, idx) => idx) : []
+      };
+    }));
+  };
+
   const convertFile = async (fileItem) => {
+    // For Excel files in 'idle' state, load sheets first
+    if (fileItem.type === 'excel' && fileItem.status === 'idle') {
+      await loadExcelSheets(fileItem);
+      return;
+    }
+
+    // For Excel files in 'loaded' state, convert selected sheets
+    if (fileItem.type === 'excel' && fileItem.status === 'loaded') {
+      if (fileItem.selectedSheets.length === 0) {
+        alert('少なくとも1つのシートを選択してください');
+        return;
+      }
+    }
+
     setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'converting' } : f));
 
     try {
@@ -79,8 +154,18 @@ function App() {
 
       setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'success' } : f));
     } catch (error) {
-      console.error(error);
-      setFiles(prev => prev.map(f => f.id === fileItem.id ? { ...f, status: 'error', errorMessage: 'Conversion failed' } : f));
+      console.error('Conversion error:', error);
+      const errorMsg = error.message || 'Conversion failed';
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      });
+      setFiles(prev => prev.map(f => f.id === fileItem.id ? {
+        ...f,
+        status: 'error',
+        errorMessage: errorMsg.length > 50 ? errorMsg.substring(0, 50) + '...' : errorMsg
+      } : f));
     }
   };
 
@@ -96,56 +181,117 @@ function App() {
           const workbook = new ExcelJS.Workbook();
           await workbook.xlsx.load(arrayBuffer);
 
-          let combinedHtml = '';
+          const baseFileName = fileItem.name.replace(/\.[^/.]+$/, "");
+          const sheets = [];
 
-          workbook.eachSheet((worksheet, sheetId) => {
-            const sheetHtml = generateSheetHtmlWithExcelJS(worksheet);
-
-            if (sheetHtml) {
-              combinedHtml += `
-                <div class="sheet-container">
-                  <h2>${worksheet.name}</h2>
-                  ${sheetHtml}
-                </div>
-              `;
-            }
+          workbook.eachSheet((worksheet) => {
+            sheets.push(worksheet);
           });
 
-          if (!combinedHtml) {
-            throw new Error("No content found in Excel file.");
+          console.log('Workbook loaded, sheets:', sheets.length);
+
+          // Get selected sheet indices (default to all if not specified)
+          const selectedIndices = fileItem.selectedSheets && fileItem.selectedSheets.length > 0
+            ? fileItem.selectedSheets
+            : sheets.map((_, idx) => idx);
+
+          console.log(`Converting ${selectedIndices.length} of ${sheets.length} sheets`);
+
+          // Process only selected sheets
+          for (let i = 0; i < selectedIndices.length; i++) {
+            const index = selectedIndices[i];
+            const worksheet = sheets[index];
+            console.log(`Processing sheet ${i + 1}/${selectedIndices.length}: ${worksheet.name}`);
+
+            try {
+              const sheetHtml = generateSheetHtmlWithExcelJS(worksheet);
+
+              if (sheetHtml) {
+                const htmlWithHeader = `
+                  <div class="sheet-container">
+                    <h2>${worksheet.name}</h2>
+                    ${sheetHtml}
+                  </div>
+                `;
+
+                // Generate individual image for each sheet
+                const sheetFileName = `${baseFileName}_${String(index + 1).padStart(2, '0')}_${worksheet.name.replace(/[^\w\s-]/g, '_')}`;
+                await new Promise((resolveSheet, rejectSheet) => {
+                  generateImage(htmlWithHeader, sheetFileName, resolveSheet, rejectSheet, 'excel');
+                });
+
+                // Small delay between sheets
+                await new Promise(r => setTimeout(r, 100));
+              }
+            } catch (sheetError) {
+              console.error(`Error processing sheet "${worksheet.name}":`, sheetError);
+              // Continue with other sheets
+            }
           }
 
-          generateImage(combinedHtml, fileItem.name.replace(/\.[^/.]+$/, ""), resolve, reject, 'excel');
+          resolve();
         } else {
           // Use SheetJS for .xls files (legacy format)
           const arrayBuffer = await fileItem.file.arrayBuffer();
           const data = new Uint8Array(arrayBuffer);
+
+          console.log('Loading .xls file with SheetJS, size:', data.length, 'bytes');
+
           const workbook = XLSX.read(data, { type: 'array', cellStyles: true });
 
-          let combinedHtml = '';
+          console.log('Workbook loaded, sheets:', workbook.SheetNames.length);
 
-          workbook.SheetNames.forEach(sheetName => {
+          const baseFileName = fileItem.name.replace(/\.[^/.]+$/, "");
+
+          // Get selected sheet indices (default to all if not specified)
+          const selectedIndices = fileItem.selectedSheets && fileItem.selectedSheets.length > 0
+            ? fileItem.selectedSheets
+            : workbook.SheetNames.map((_, idx) => idx);
+
+          console.log(`Converting ${selectedIndices.length} of ${workbook.SheetNames.length} sheets`);
+
+          // Process only selected sheets
+          for (let i = 0; i < selectedIndices.length; i++) {
+            const index = selectedIndices[i];
+            const sheetName = workbook.SheetNames[index];
+            console.log(`Processing sheet ${i + 1}/${selectedIndices.length}: ${sheetName}`);
+
             const worksheet = workbook.Sheets[sheetName];
 
-            if (!worksheet['!ref']) return;
-
-            const sheetHtml = generateSheetHtmlWithSheetJS(worksheet);
-
-            if (sheetHtml) {
-              combinedHtml += `
-                <div class="sheet-container">
-                  <h2>${sheetName}</h2>
-                  ${sheetHtml}
-                </div>
-              `;
+            if (!worksheet['!ref']) {
+              console.log(`Sheet "${sheetName}" has no range, skipping`);
+              continue;
             }
-          });
 
-          if (!combinedHtml) {
-            throw new Error("No content found in Excel file.");
+            console.log(`Sheet "${sheetName}" range:`, worksheet['!ref']);
+
+            try {
+              const sheetHtml = generateSheetHtmlWithSheetJS(worksheet);
+
+              if (sheetHtml) {
+                const htmlWithHeader = `
+                  <div class="sheet-container">
+                    <h2>${sheetName}</h2>
+                    ${sheetHtml}
+                  </div>
+                `;
+
+                // Generate individual image for each sheet
+                const sheetFileName = `${baseFileName}_${String(index + 1).padStart(2, '0')}_${sheetName.replace(/[^\w\s-]/g, '_')}`;
+                await new Promise((resolveSheet, rejectSheet) => {
+                  generateImage(htmlWithHeader, sheetFileName, resolveSheet, rejectSheet, 'excel');
+                });
+
+                // Small delay between sheets to avoid overwhelming the browser
+                await new Promise(r => setTimeout(r, 100));
+              }
+            } catch (sheetError) {
+              console.error(`Error processing sheet "${sheetName}":`, sheetError);
+              // Continue with other sheets
+            }
           }
 
-          generateImage(combinedHtml, fileItem.name.replace(/\.[^/.]+$/, ""), resolve, reject, 'excel');
+          resolve();
         }
       } catch (err) {
         reject(err);
@@ -627,55 +773,110 @@ function App() {
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, height: 0 }}
-                className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center gap-4 shadow-sm"
+                className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm"
               >
-                <div className={`p-3 rounded-lg ${file.type === 'excel' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'}`}>
-                  {file.type === 'excel' ? <Table className="w-6 h-6" /> : <FileText className="w-6 h-6" />}
-                </div>
+                <div className="flex items-center gap-4">
+                  <div className={`p-3 rounded-lg ${file.type === 'excel' ? 'bg-green-500/10 text-green-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                    {file.type === 'excel' ? <Table className="w-6 h-6" /> : <FileText className="w-6 h-6" />}
+                  </div>
 
-                <div className="flex-1 min-w-0">
-                  <h3 className="font-medium text-slate-200 truncate">{file.name}</h3>
-                  <p className="text-sm text-slate-500">{file.size}</p>
-                </div>
+                  <div className="flex-1 min-w-0">
+                    <h3 className="font-medium text-slate-200 truncate">{file.name}</h3>
+                    <p className="text-sm text-slate-500">
+                      {file.size}
+                      {file.sheets && <span className="ml-2">• {file.sheets.length} sheets</span>}
+                    </p>
+                  </div>
 
-                <div className="flex items-center gap-3">
-                  {file.status === 'idle' && (
+                  <div className="flex items-center gap-3">
+                    {file.status === 'idle' && (
+                      <button
+                        onClick={() => convertFile(file)}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        {file.type === 'excel' ? 'Load Sheets' : 'Convert'}
+                      </button>
+                    )}
+
+                    {file.status === 'loaded' && (
+                      <button
+                        onClick={() => convertFile(file)}
+                        className="px-4 py-2 bg-green-600 hover:bg-green-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      >
+                        Convert {file.selectedSheets.length} Sheet{file.selectedSheets.length !== 1 ? 's' : ''}
+                      </button>
+                    )}
+
+                    {file.status === 'converting' && (
+                      <div className="flex items-center gap-2 text-blue-400">
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span className="text-sm">Processing...</span>
+                      </div>
+                    )}
+
+                    {file.status === 'success' && (
+                      <div className="flex items-center gap-2 text-green-400">
+                        <CheckCircle className="w-5 h-5" />
+                        <span className="text-sm">Done</span>
+                      </div>
+                    )}
+
+                    {file.status === 'error' && (
+                      <div className="flex items-center gap-2 text-red-400" title={file.errorMessage}>
+                        <AlertCircle className="w-5 h-5" />
+                        <span className="text-sm">Failed</span>
+                      </div>
+                    )}
+
                     <button
-                      onClick={() => convertFile(file)}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors flex items-center gap-2"
+                      onClick={() => removeFile(file.id)}
+                      className="p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-lg transition-colors"
                     >
-                      Convert
+                      <X className="w-5 h-5" />
                     </button>
-                  )}
-
-                  {file.status === 'converting' && (
-                    <div className="flex items-center gap-2 text-blue-400">
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      <span className="text-sm">Processing...</span>
-                    </div>
-                  )}
-
-                  {file.status === 'success' && (
-                    <div className="flex items-center gap-2 text-green-400">
-                      <CheckCircle className="w-5 h-5" />
-                      <span className="text-sm">Done</span>
-                    </div>
-                  )}
-
-                  {file.status === 'error' && (
-                    <div className="flex items-center gap-2 text-red-400" title={file.errorMessage}>
-                      <AlertCircle className="w-5 h-5" />
-                      <span className="text-sm">Failed</span>
-                    </div>
-                  )}
-
-                  <button
-                    onClick={() => removeFile(file.id)}
-                    className="p-2 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded-lg transition-colors"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
+                  </div>
                 </div>
+
+                {/* Sheet selection UI */}
+                {file.status === 'loaded' && file.sheets && (
+                  <div className="mt-4 pt-4 border-t border-slate-700">
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="text-sm font-medium text-slate-300">Select Sheets to Convert</h4>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => toggleAllSheets(file.id, true)}
+                          className="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors"
+                        >
+                          All
+                        </button>
+                        <button
+                          onClick={() => toggleAllSheets(file.id, false)}
+                          className="text-xs px-2 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded transition-colors"
+                        >
+                          None
+                        </button>
+                      </div>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto space-y-1 pr-2">
+                      {file.sheets.map((sheetName, index) => (
+                        <label
+                          key={index}
+                          className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-750 rounded cursor-pointer transition-colors"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={file.selectedSheets.includes(index)}
+                            onChange={() => toggleSheetSelection(file.id, index)}
+                            className="w-4 h-4 text-blue-600 bg-slate-700 border-slate-600 rounded focus:ring-blue-500 focus:ring-2"
+                          />
+                          <span className="text-sm text-slate-300 flex-1 truncate">
+                            {String(index + 1).padStart(2, '0')}. {sheetName}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </Motion.div>
             ))}
           </AnimatePresence>
